@@ -1007,6 +1007,7 @@ fn add_ephemeral_table_to_update_plan(
                 cte_id: None,
                 cte_definition_only: false,
                 rowid_referenced: false,
+                scope_depth: 0,
             });
     }
 
