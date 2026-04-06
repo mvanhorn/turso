@@ -2692,7 +2692,19 @@ pub fn compute_virtual_columns<'a>(
     for col_mapping in col_mappings {
         if let GeneratedType::Virtual { resolved: expr, .. } = col_mapping.column.generated_type() {
             program.with_self_table_context(Some(&ctx), |program, _| {
-                translate_expr(program, None, expr, col_mapping.register, resolver)?;
+                // Must use translate_expr_no_constant_opt here because the virtual
+                // column register is initialized to NULL earlier in the INSERT body.
+                // If we use translate_expr, constant expressions (e.g. AS('Y')) get
+                // hoisted into the init section, and the NULL instruction in the main
+                // body overwrites the computed value before the index record is built.
+                translate_expr_no_constant_opt(
+                    program,
+                    None,
+                    expr,
+                    col_mapping.register,
+                    resolver,
+                    NoConstantOptReason::RegisterReuse,
+                )?;
                 Ok(())
             })?;
             if col_mapping.column.affinity() != Affinity::Blob {
