@@ -1,0 +1,85 @@
+@database :memory:
+
+# Regression test: a VIRTUAL generated column whose expression is a constant
+# must produce the constant value when an index over the column forces the
+# value to be materialized into its register during INSERT.
+#
+# Previously, constant-folding hoisted the expression into the program init
+# section, but the main INSERT body re-initialized the column register to
+# NULL afterwards, so the index record was built with NULL instead of the
+# constant.
+
+setup schema-constant-text {
+    CREATE TABLE t1(a INTEGER, b AS ('Y') VIRTUAL);
+    CREATE INDEX t1_b ON t1(b);
+    INSERT INTO t1(a) VALUES(1);
+    INSERT INTO t1(a) VALUES(2);
+}
+
+@setup schema-constant-text
+test gencol-virtual-constant-text-select {
+    SELECT a, b FROM t1 ORDER BY a;
+}
+expect {
+    1|Y
+    2|Y
+}
+
+@setup schema-constant-text
+test gencol-virtual-constant-text-index-lookup {
+    SELECT a FROM t1 WHERE b = 'Y' ORDER BY a;
+}
+expect {
+    1
+    2
+}
+
+@setup schema-constant-text
+test gencol-virtual-constant-text-index-no-match {
+    SELECT a FROM t1 WHERE b = 'N';
+}
+expect {
+}
+
+setup schema-constant-int {
+    CREATE TABLE t2(a INTEGER, b AS (42) VIRTUAL);
+    CREATE INDEX t2_b ON t2(b);
+    INSERT INTO t2(a) VALUES(10);
+    INSERT INTO t2(a) VALUES(20);
+}
+
+@setup schema-constant-int
+test gencol-virtual-constant-int-index-lookup {
+    SELECT a FROM t2 WHERE b = 42 ORDER BY a;
+}
+expect {
+    10
+    20
+}
+
+# Mixed: one constant virtual column and one expression virtual column,
+# both indexed.
+setup schema-mixed {
+    CREATE TABLE t3(a INTEGER, b AS ('K') VIRTUAL, c AS (a*2) VIRTUAL);
+    CREATE INDEX t3_b ON t3(b);
+    CREATE INDEX t3_c ON t3(c);
+    INSERT INTO t3(a) VALUES(3);
+    INSERT INTO t3(a) VALUES(7);
+}
+
+@setup schema-mixed
+test gencol-virtual-mixed-select {
+    SELECT a, b, c FROM t3 ORDER BY a;
+}
+expect {
+    3|K|6
+    7|K|14
+}
+
+@setup schema-mixed
+test gencol-virtual-mixed-index-lookup {
+    SELECT a FROM t3 WHERE b = 'K' AND c = 14;
+}
+expect {
+    7
+}
