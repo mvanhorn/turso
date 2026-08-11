@@ -508,35 +508,85 @@ impl Plan {
         }
     }
 
-    /// Returns the IDs of every outer-query reference that this plan actually
-    /// uses. For a compound SELECT, the result spans all of its component
-    /// SELECTs. DELETE and UPDATE plans have no outer-query references and
-    /// always return an empty vector.
+    /// Returns the IDs of every outer-query reference that this plan or one of
+    /// its nested subplans actually uses. References to tables owned by an
+    /// intermediate subplan remain internal to that subplan.
+    ///
+    /// DELETE and UPDATE plans have no outer-query references and always return
+    /// an empty vector.
     pub fn used_outer_query_ref_ids(&self) -> Vec<TableInternalId> {
-        fn collect_from_select(plan: &SelectPlan, out: &mut Vec<TableInternalId>) {
-            for outer_ref in plan.table_references.outer_query_refs().iter() {
-                if outer_ref.is_used() {
+        fn collect_from_select(
+            plan: &SelectPlan,
+            accessible_table_ids: &mut Vec<TableInternalId>,
+            out: &mut Vec<TableInternalId>,
+        ) {
+            let outer_scope_base_len = accessible_table_ids.len();
+            accessible_table_ids.extend(
+                plan.table_references
+                    .joined_tables()
+                    .iter()
+                    .map(|table| table.internal_id),
+            );
+
+            for outer_ref in plan.table_references.outer_query_refs() {
+                if outer_ref.is_used()
+                    && !accessible_table_ids.contains(&outer_ref.internal_id)
+                    && !out.contains(&outer_ref.internal_id)
+                {
                     out.push(outer_ref.internal_id);
                 }
             }
-        }
-        let mut ids = Vec::new();
-        match self {
-            Plan::Select(plan) => collect_from_select(plan, &mut ids),
-            Plan::CompoundSelect {
-                left, right_most, ..
-            } => {
-                for (plan, _) in left {
-                    collect_from_select(plan, &mut ids);
+            for subquery in &plan.non_from_clause_subqueries {
+                match &subquery.state {
+                    SubqueryState::Unevaluated {
+                        plan: Some(subquery_plan),
+                    } => collect_from_plan(subquery_plan, accessible_table_ids, out),
+                    SubqueryState::Unevaluated { plan: None } => {}
+                    SubqueryState::Evaluated { outer_ref_ids, .. } => {
+                        for outer_ref_id in outer_ref_ids {
+                            if !accessible_table_ids.contains(outer_ref_id)
+                                && !out.contains(outer_ref_id)
+                            {
+                                out.push(*outer_ref_id);
+                            }
+                        }
+                    }
                 }
-                collect_from_select(right_most, &mut ids);
             }
-            Plan::RecursiveCte(plan) => {
-                ids.extend(plan.initial_query.used_outer_query_ref_ids());
-                ids.extend(plan.recursive_query.used_outer_query_ref_ids());
+            for table in plan.table_references.joined_tables() {
+                if let Table::FromClauseSubquery(subquery) = &table.table {
+                    collect_from_plan(&subquery.plan, accessible_table_ids, out);
+                }
             }
-            Plan::Delete(_) | Plan::Update(_) => {}
+
+            accessible_table_ids.truncate(outer_scope_base_len);
         }
+
+        fn collect_from_plan(
+            plan: &Plan,
+            accessible_table_ids: &mut Vec<TableInternalId>,
+            out: &mut Vec<TableInternalId>,
+        ) {
+            match plan {
+                Plan::Select(plan) => collect_from_select(plan, accessible_table_ids, out),
+                Plan::CompoundSelect {
+                    left, right_most, ..
+                } => {
+                    for (plan, _) in left {
+                        collect_from_select(plan, accessible_table_ids, out);
+                    }
+                    collect_from_select(right_most, accessible_table_ids, out);
+                }
+                Plan::RecursiveCte(plan) => {
+                    collect_from_plan(&plan.initial_query, accessible_table_ids, out);
+                    collect_from_plan(&plan.recursive_query, accessible_table_ids, out);
+                }
+                Plan::Delete(_) | Plan::Update(_) => {}
+            }
+        }
+
+        let mut ids = Vec::new();
+        collect_from_plan(self, &mut Vec::new(), &mut ids);
         ids
     }
 
