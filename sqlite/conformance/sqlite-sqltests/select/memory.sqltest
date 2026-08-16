@@ -1520,6 +1520,110 @@ expect {
     TEST
 }
 
+# A plain column has an implicit BINARY collation, which takes precedence over
+# the declared collation of a later compound arm.
+@cross-check-integrity
+test collate-compound-implicit-binary-set-operators {
+    CREATE TABLE left_plain(x TEXT);
+    CREATE TABLE right_nocase(x TEXT COLLATE NOCASE);
+    INSERT INTO left_plain VALUES ('a'), ('A');
+    INSERT INTO right_nocase VALUES ('A');
+    SELECT 'union', x FROM left_plain UNION SELECT 'union', x FROM right_nocase;
+    SELECT 'intersect', x FROM left_plain INTERSECT SELECT 'intersect', x FROM right_nocase;
+    SELECT 'except', x FROM left_plain EXCEPT SELECT 'except', x FROM right_nocase;
+}
+expect {
+    union|A
+    union|a
+    intersect|A
+    except|a
+}
+
+@cross-check-integrity
+test collate-compound-implicit-binary-order-by {
+    CREATE TABLE left_plain(x TEXT);
+    CREATE TABLE right_nocase(x TEXT COLLATE NOCASE);
+    INSERT INTO left_plain VALUES ('a'), ('A');
+    INSERT INTO right_nocase VALUES ('A');
+    SELECT x FROM left_plain UNION ALL SELECT x FROM right_nocase ORDER BY 1;
+}
+expect {
+    A
+    A
+    a
+}
+
+@cross-check-integrity
+test collate-compound-explicit-left-controls {
+    CREATE TABLE left_plain(x TEXT);
+    CREATE TABLE right_nocase(x TEXT COLLATE NOCASE);
+    CREATE TABLE right_binary(x TEXT COLLATE BINARY);
+    INSERT INTO left_plain VALUES ('a'), ('A');
+    INSERT INTO right_nocase VALUES ('A');
+    INSERT INTO right_binary VALUES ('A');
+    SELECT 'nocase', x COLLATE NOCASE FROM left_plain
+    UNION SELECT 'nocase', x FROM right_binary;
+    SELECT 'binary', x COLLATE BINARY FROM left_plain
+    UNION SELECT 'binary', x FROM right_nocase;
+}
+expect {
+    nocase|A
+    binary|A
+    binary|a
+}
+
+# Expressions without a result collation may use the declared collation of a
+# later compound arm, even when they contain a column reference.
+@cross-check-integrity
+test collate-compound-collationless-left-expressions {
+    CREATE TABLE left_plain(x TEXT);
+    CREATE TABLE right_nocase(x TEXT COLLATE NOCASE);
+    INSERT INTO left_plain VALUES ('a'), ('A');
+    INSERT INTO right_nocase VALUES ('A');
+    SELECT 'literal', 'a' UNION SELECT 'literal', x FROM right_nocase;
+    SELECT 'function', printf('%s', x) FROM left_plain
+    UNION SELECT 'function', x FROM right_nocase;
+    SELECT 'concat', x || '' FROM left_plain
+    UNION SELECT 'concat', x FROM right_nocase;
+}
+expect {
+    literal|A
+    function|A
+    concat|A
+}
+
+@cross-check-integrity
+test collate-compound-columns-resolve-independently {
+    CREATE TABLE left_columns(x TEXT, n TEXT COLLATE NOCASE);
+    CREATE TABLE right_columns(x TEXT COLLATE NOCASE, b TEXT COLLATE BINARY);
+    INSERT INTO left_columns VALUES ('a', 'z'), ('A', 'Z');
+    INSERT INTO right_columns VALUES ('A', 'z');
+    SELECT x, n FROM left_columns
+    UNION SELECT x, b FROM right_columns
+    ORDER BY 1, 2;
+}
+expect {
+    A|z
+    a|z
+}
+
+@cross-check-integrity
+test collate-compound-leftmost-arm-controls-shared-index {
+    CREATE TABLE first_nocase(x TEXT COLLATE NOCASE);
+    CREATE TABLE middle_binary(x TEXT);
+    CREATE TABLE last_nocase(x TEXT COLLATE NOCASE);
+    INSERT INTO first_nocase VALUES ('a');
+    INSERT INTO middle_binary VALUES ('A');
+    INSERT INTO last_nocase VALUES ('A');
+    SELECT x FROM first_nocase
+    UNION SELECT x FROM middle_binary
+    UNION SELECT x FROM last_nocase
+    ORDER BY 1;
+}
+expect {
+    A
+}
+
 # Test three-way compound with different collations
 @cross-check-integrity
 test collate-compound-14 {

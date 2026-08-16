@@ -1,7 +1,7 @@
 use crate::alloc::TursoIteratorExt;
 use crate::schema::{Index, IndexColumn, PseudoCursorType};
 use crate::sync::Arc;
-use crate::translate::collate::get_collseq_from_expr;
+use crate::translate::collate::{get_compound_select_collseq, CollationSeq};
 use crate::translate::emitter::{
     select::{emit_materialized_build_inputs, emit_query},
     LimitCtx, Resolver, TranslateCtx,
@@ -137,11 +137,13 @@ pub fn emit_program_for_compound_select(
 
     let real_query_destination = right_most.query_destination.clone();
     let num_result_cols = right_most.result_columns.len();
+    let compound_collations = resolve_compound_select_collations(left, right_most)?;
 
     // When ORDER BY is present, redirect compound output to a collection index,
     // then sort and emit to the real destination afterwards.
     let (query_destination, collection_cursor, collection_index) = if has_order_by {
-        let (cursor_id, index) = create_collection_index(program, &left[0].0, right_most)?;
+        let (cursor_id, index) =
+            create_collection_index(program, right_most, &compound_collations)?;
         let dest = QueryDestination::EphemeralIndex {
             cursor_id,
             index: index.clone(),
@@ -205,6 +207,7 @@ pub fn emit_program_for_compound_select(
             program,
             left,
             right_most,
+            &compound_collations,
             &limit_owned,
             &offset_owned,
             &right_most_ctx.resolver,
@@ -262,6 +265,7 @@ fn emit_compound_select(
     program: &mut ProgramBuilder,
     left: &mut [(SelectPlan, CompoundOperator)],
     right_most: &mut SelectPlan,
+    compound_collations: &[Option<CollationSeq>],
     limit: &Option<Box<Expr>>,
     offset: &Option<Box<Expr>>,
     resolver: &Resolver,
@@ -301,6 +305,7 @@ fn emit_compound_select(
                     program,
                     left,
                     plan,
+                    compound_collations,
                     limit,
                     offset,
                     resolver,
@@ -344,7 +349,7 @@ fn emit_compound_select(
                     } if !index.has_rowid => (*cursor_id, index.clone()),
                     _ => {
                         new_dedupe_index = true;
-                        create_dedupe_index(program, plan, right_most)?
+                        create_dedupe_index(program, right_most, compound_collations)?
                     }
                 };
                 plan.query_destination = QueryDestination::EphemeralIndex {
@@ -357,6 +362,7 @@ fn emit_compound_select(
                     program,
                     left,
                     plan,
+                    compound_collations,
                     limit,
                     offset,
                     resolver,
@@ -397,7 +403,8 @@ fn emit_compound_select(
                 // this BEFORE we overwrite it with our own indexes for the intersection.
                 let intersect_destination = right_most.query_destination.clone();
 
-                let (left_cursor_id, left_index) = create_dedupe_index(program, plan, right_most)?;
+                let (left_cursor_id, left_index) =
+                    create_dedupe_index(program, right_most, compound_collations)?;
                 plan.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: left_cursor_id,
                     index: left_index.clone(),
@@ -406,7 +413,7 @@ fn emit_compound_select(
                 };
 
                 let (right_cursor_id, right_index) =
-                    create_dedupe_index(program, plan, right_most)?;
+                    create_dedupe_index(program, right_most, compound_collations)?;
                 right_most.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: right_cursor_id,
                     index: right_index,
@@ -417,6 +424,7 @@ fn emit_compound_select(
                     program,
                     left,
                     plan,
+                    compound_collations,
                     limit,
                     offset,
                     resolver,
@@ -450,7 +458,7 @@ fn emit_compound_select(
                     } if !index.has_rowid => (*cursor_id, index.clone()),
                     _ => {
                         new_index = true;
-                        create_dedupe_index(program, plan, right_most)?
+                        create_dedupe_index(program, right_most, compound_collations)?
                     }
                 };
                 plan.query_destination = QueryDestination::EphemeralIndex {
@@ -463,6 +471,7 @@ fn emit_compound_select(
                     program,
                     left,
                     plan,
+                    compound_collations,
                     limit,
                     offset,
                     resolver,
@@ -520,8 +529,8 @@ fn emit_compound_select(
 // Creates an ephemeral index that will be used to deduplicate the results of any sub-selects
 fn create_dedupe_index(
     program: &mut ProgramBuilder,
-    left_select: &SelectPlan,
     right_select: &SelectPlan,
+    compound_collations: &[Option<CollationSeq>],
 ) -> crate::Result<(usize, Arc<Index>)> {
     let mut dedupe_columns = right_select
         .result_columns
@@ -536,23 +545,7 @@ fn create_dedupe_index(
             )
         })
         .try_collect::<crate::alloc::Vec<_>>()?;
-    for (i, column) in dedupe_columns.iter_mut().enumerate() {
-        let left_collation = get_collseq_from_expr(
-            &left_select.result_columns[i].expr,
-            &left_select.table_references,
-        )?;
-        let right_collation = get_collseq_from_expr(
-            &right_select.result_columns[i].expr,
-            &right_select.table_references,
-        )?;
-        // Left precedence
-        let collation = match (left_collation, right_collation) {
-            (None, None) => None,
-            (Some(coll), None) | (None, Some(coll)) => Some(coll),
-            (Some(coll), Some(_)) => Some(coll),
-        };
-        column.collation = collation;
-    }
+    set_compound_index_collations(&mut dedupe_columns, compound_collations);
 
     let dedupe_index = Arc::new(Index {
         columns: dedupe_columns,
@@ -740,8 +733,8 @@ pub(crate) fn set_select_plan_destination(plan: &mut Plan, destination: &QueryDe
 /// Uses `has_rowid=true` to allow duplicate entries (needed for UNION ALL).
 fn create_collection_index(
     program: &mut ProgramBuilder,
-    left_select: &SelectPlan,
     right_select: &SelectPlan,
+    compound_collations: &[Option<CollationSeq>],
 ) -> crate::Result<(usize, Arc<Index>)> {
     let mut columns = right_select
         .result_columns
@@ -760,22 +753,7 @@ fn create_collection_index(
             expr: None,
         })
         .try_collect::<crate::alloc::Vec<_>>()?;
-    for (i, column) in columns.iter_mut().enumerate() {
-        let left_collation = get_collseq_from_expr(
-            &left_select.result_columns[i].expr,
-            &left_select.table_references,
-        )?;
-        let right_collation = get_collseq_from_expr(
-            &right_select.result_columns[i].expr,
-            &right_select.table_references,
-        )?;
-        let collation = match (left_collation, right_collation) {
-            (None, None) => None,
-            (Some(coll), None) | (None, Some(coll)) => Some(coll),
-            (Some(coll), Some(_)) => Some(coll),
-        };
-        column.collation = collation;
-    }
+    set_compound_index_collations(&mut columns, compound_collations);
 
     let index = Arc::new(Index {
         columns,
@@ -795,6 +773,42 @@ fn create_collection_index(
         is_table: false,
     });
     Ok((cursor_id, index))
+}
+
+fn resolve_compound_select_collations(
+    left: &[(SelectPlan, CompoundOperator)],
+    right_most: &SelectPlan,
+) -> crate::Result<crate::alloc::Vec<Option<CollationSeq>>> {
+    let mut collations = (0..right_most.result_columns.len())
+        .map(|_| None)
+        .try_collect::<crate::alloc::Vec<_>>()?;
+    for (column_index, compound_collation) in collations.iter_mut().enumerate() {
+        for select in left
+            .iter()
+            .map(|(select, _)| select)
+            .chain(std::iter::once(right_most))
+        {
+            let collation = get_compound_select_collseq(
+                &select.result_columns[column_index].expr,
+                &select.table_references,
+            )?;
+            if collation.is_some() {
+                *compound_collation = collation;
+                break;
+            }
+        }
+    }
+    Ok(collations)
+}
+
+fn set_compound_index_collations(
+    columns: &mut [IndexColumn],
+    compound_collations: &[Option<CollationSeq>],
+) {
+    assert_eq!(columns.len(), compound_collations.len());
+    for (column, collation) in columns.iter_mut().zip(compound_collations) {
+        column.collation = *collation;
+    }
 }
 
 /// Emits bytecode for sorting compound select results and outputting them.

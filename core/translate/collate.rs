@@ -7,7 +7,7 @@ use std::{
 
 use icu_collator::{options::CollatorOptions, Collator, CollatorBorrowed};
 use icu_locale::Locale;
-use turso_parser::ast::Expr;
+use turso_parser::ast::{Expr, UnaryOperator};
 
 use crate::{
     connection::SymbolTable,
@@ -377,6 +377,62 @@ pub fn get_collseq_from_expr_with_symbols(
     Ok(explicit.or(column))
 }
 
+/// Return the collation contributed by one result expression in a compound SELECT.
+///
+/// A plain column contributes its effective collation, including its implicit
+/// BINARY collation. Other expressions have no collation unless they contain an
+/// explicit COLLATE operator, so a later compound arm may supply the collation.
+pub fn get_compound_select_collseq(
+    top_expr: &Expr,
+    referenced_tables: &TableReferences,
+) -> Result<Option<CollationSeq>> {
+    let (explicit, _) =
+        get_collseq_parts_from_expr_with_symbols(top_expr, referenced_tables, None)?;
+    if explicit.is_some() {
+        return Ok(explicit);
+    }
+
+    get_effective_column_collseq(top_expr, referenced_tables)
+}
+
+fn get_effective_column_collseq(
+    expr: &Expr,
+    referenced_tables: &TableReferences,
+) -> Result<Option<CollationSeq>> {
+    match expr {
+        Expr::Column { table, column, .. } => {
+            let (_, table_ref) = referenced_tables
+                .find_table_by_internal_id(*table)
+                .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string()))?;
+            let column = table_ref
+                .get_column_at(*column)
+                .ok_or_else(|| crate::LimboError::ParseError("column not found".to_string()))?;
+            Ok(Some(column.collation()))
+        }
+        Expr::RowId { table, .. } => {
+            let (_, table_ref) = referenced_tables
+                .find_table_by_internal_id(*table)
+                .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string()))?;
+            let collation = table_ref
+                .btree()
+                .and_then(|btree| {
+                    btree
+                        .get_rowid_alias_column()
+                        .map(|(_, column)| column.collation())
+                })
+                .unwrap_or(CollationSeq::Binary);
+            Ok(Some(collation))
+        }
+        Expr::Cast { expr, .. } | Expr::Unary(UnaryOperator::Positive, expr) => {
+            get_effective_column_collseq(expr, referenced_tables)
+        }
+        Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            get_effective_column_collseq(&exprs[0], referenced_tables)
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Return the collation context that standalone expression translation would
 /// propagate to a parent comparison when this expression is reused from cache.
 ///
@@ -587,6 +643,44 @@ mod tests {
             let collseq = get_collseq_from_expr(&expr, &table_references).unwrap();
             assert_eq!(collseq, collation);
         }
+    }
+
+    #[test]
+    fn test_get_compound_select_collseq_distinguishes_columns_from_expressions() {
+        let table_references = get_table_references_single_table_single_column_with_collation(None);
+        let column = Expr::Column {
+            database: None,
+            table: TableInternalId::from(1),
+            column: 0,
+            is_rowid_alias: false,
+        };
+
+        assert_eq!(
+            get_compound_select_collseq(&column, &table_references).unwrap(),
+            Some(CollationSeq::Binary)
+        );
+
+        let explicit = Expr::Collate(Box::new(column.clone()), Name::exact("NOCASE".to_string()));
+        assert_eq!(
+            get_compound_select_collseq(&explicit, &table_references).unwrap(),
+            Some(CollationSeq::NoCase)
+        );
+
+        let literal = Expr::Literal(Literal::String("abc".to_string()));
+        assert_eq!(
+            get_compound_select_collseq(&literal, &table_references).unwrap(),
+            None
+        );
+
+        let concatenation = Expr::binary(
+            column,
+            Operator::Concat,
+            Expr::Literal(Literal::String(String::new())),
+        );
+        assert_eq!(
+            get_compound_select_collseq(&concatenation, &table_references).unwrap(),
+            None
+        );
     }
 
     #[test]
