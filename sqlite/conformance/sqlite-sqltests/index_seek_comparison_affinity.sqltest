@@ -163,3 +163,79 @@ test issue-6715-real-affinity-seek-computed-expr {
 expect {
 0|1
 }
+
+setup issue-8755-real-in-schema {
+    CREATE TABLE t(x REAL, y INTEGER);
+    CREATE INDEX i ON t(x);
+    CREATE INDEX j ON t(y);
+    INSERT INTO t VALUES (9007199254740992, 0);
+}
+
+@setup issue-8755-real-in-schema
+test issue-8755-real-in-access-paths {
+    SELECT
+        (SELECT count(*) FROM t WHERE x IN (9007199254740993)),
+        (SELECT count(*) FROM t WHERE x NOT IN (9007199254740993));
+    SELECT
+        (SELECT count(*) FROM t INDEXED BY i WHERE x IN (9007199254740993)),
+        (SELECT count(*) FROM t NOT INDEXED WHERE x IN (9007199254740993)),
+        (SELECT count(*) FROM t WHERE x = 9007199254740993);
+}
+expect {
+0|1
+0|0|0
+}
+
+@setup issue-8755-real-in-schema
+test issue-8755-real-in-members {
+    SELECT
+        (SELECT count(*) FROM t WHERE x IN (9007199254740992)),
+        (SELECT count(*) FROM t WHERE x IN (9007199254740993, 9007199254740992, 9007199254740992)),
+        (SELECT count(*) FROM t WHERE x IN (9007199254740993 + 0)),
+        (SELECT count(*) FROM t WHERE x IN ('9007199254740993'));
+    INSERT INTO t VALUES (-9007199254740992, 0), (9007199254740991, 0), (1.5, 0);
+    SELECT
+        (SELECT count(*) FROM t WHERE x IN (-9007199254740992)),
+        (SELECT count(*) FROM t WHERE x IN (-9007199254740993)),
+        (SELECT count(*) FROM t WHERE x IN (9007199254740991)),
+        (SELECT count(*) FROM t WHERE x IN (1.5));
+}
+expect {
+1|1|0|0
+1|0|1|1
+}
+
+@setup issue-8755-real-in-schema
+test issue-8755-real-in-null {
+    SELECT
+        (SELECT count(*) FROM t WHERE x IN (9007199254740993, NULL)),
+        x IN (9007199254740993, NULL),
+        x NOT IN (9007199254740993, NULL)
+    FROM t;
+    SELECT count(*) FROM t WHERE x IN (9007199254740992, NULL);
+}
+expect {
+0||
+1
+}
+
+@setup issue-8755-real-in-schema
+test issue-8755-real-in-delete {
+    DELETE FROM t WHERE x IN (9007199254740993);
+    SELECT count(*) FROM t;
+    DELETE FROM t WHERE x IN (9007199254740992);
+    SELECT count(*) FROM t;
+}
+expect {
+1
+0
+}
+
+@setup issue-8755-real-in-schema
+test issue-8755-real-in-multi-index-or {
+    INSERT INTO t VALUES (42, 1);
+    SELECT count(*) FROM t WHERE x IN (9007199254740993) OR y = 1;
+}
+expect {
+1
+}

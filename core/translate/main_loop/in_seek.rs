@@ -50,7 +50,12 @@ pub(super) fn open_in_seek_source_cursor(
             });
             let val_reg = program.alloc_register();
             let record_reg = program.alloc_register();
-            let affinity_str = affinity.aff_mask().to_string();
+            let affinity_str = match affinity {
+                Affinity::Real => Affinity::Numeric,
+                affinity => *affinity,
+            }
+            .aff_mask()
+            .to_string();
             for value in values.iter() {
                 translate_expr_no_constant_opt(
                     program,
