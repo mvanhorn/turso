@@ -3333,8 +3333,14 @@ impl PostgreSQLTranslator {
             }
         }
 
-        let translated_order = self.translate_order_by(&func_call.agg_order)?;
+        let mut translated_order = self.translate_order_by(&func_call.agg_order)?;
         let (order_by, within_group) = if func_call.agg_within_group {
+            // Ordered-set aggregates reject DESC and any explicit NULLS placement.
+            // Filling the PostgreSQL default would make a plain `ORDER BY x` look
+            // explicit and turn that supported form into the existing diagnostic.
+            // These aggregates ignore NULL inputs, so an omitted placement can stay
+            // unset. Explicit NULLS and DESC are left in place.
+            Self::restore_omitted_nulls(&mut translated_order, &func_call.agg_order);
             (vec![], translated_order)
         } else {
             (translated_order, vec![])
@@ -4004,6 +4010,10 @@ impl PostgreSQLTranslator {
                         _ => None, // Default or undefined
                     };
 
+                    // PostgreSQL places NULLs last for ASC and the default direction,
+                    // and first for DESC. Explicit NULLS FIRST/LAST overrides that.
+                    // SQLite's defaults are the reverse, so an omitted placement has
+                    // to be emitted explicitly rather than left for the engine.
                     let nulls =
                         match pg_query::protobuf::SortByNulls::try_from(sort_by.sortby_nulls) {
                             Ok(pg_query::protobuf::SortByNulls::SortbyNullsFirst) => {
@@ -4012,7 +4022,10 @@ impl PostgreSQLTranslator {
                             Ok(pg_query::protobuf::SortByNulls::SortbyNullsLast) => {
                                 Some(ast::NullsOrder::Last)
                             }
-                            _ => None,
+                            _ => Some(match order {
+                                Some(ast::SortOrder::Desc) => ast::NullsOrder::First,
+                                _ => ast::NullsOrder::Last,
+                            }),
                         };
 
                     sorted_columns.push(ast::SortedColumn { expr, order, nulls });
@@ -4026,6 +4039,26 @@ impl PostgreSQLTranslator {
             }
         }
         Ok(sorted_columns)
+    }
+
+    /// Put `nulls` back to `None` where the PostgreSQL sort item omitted NULLS FIRST/LAST.
+    fn restore_omitted_nulls(
+        columns: &mut [ast::SortedColumn],
+        sort_clause: &[pg_query::protobuf::Node],
+    ) {
+        for (column, node) in columns.iter_mut().zip(sort_clause.iter()) {
+            let Some(pg_query::protobuf::node::Node::SortBy(sort_by)) = &node.node else {
+                continue;
+            };
+            let explicit = matches!(
+                pg_query::protobuf::SortByNulls::try_from(sort_by.sortby_nulls),
+                Ok(pg_query::protobuf::SortByNulls::SortbyNullsFirst)
+                    | Ok(pg_query::protobuf::SortByNulls::SortbyNullsLast)
+            );
+            if !explicit {
+                column.nulls = None;
+            }
+        }
     }
 
     fn translate_bool_expr(
@@ -7047,74 +7080,80 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_function_within_group_order_is_translated() {
+    fn function_sort_column(sql: &str) -> ast::SortedColumn {
         let translator = PostgreSQLTranslator::new();
-        let sql = "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM test";
         let parsed = crate::parse(sql).unwrap();
         let translated = translator.translate(&parsed).unwrap();
-
         let ast::Stmt::Select(select) = translated else {
-            panic!("expected select statement");
+            panic!("expected select statement for {sql}");
         };
-        let ast::OneSelect::Select { columns, .. } = &select.body.select else {
-            panic!("expected select body");
+        let ast::OneSelect::Select { columns, .. } = select.body.select else {
+            panic!("expected select body for {sql}");
         };
-        let ast::ResultColumn::Expr(expr, _) = &columns[0] else {
-            panic!("expected result column");
+        let ast::ResultColumn::Expr(expr, _) = columns.into_iter().next().unwrap() else {
+            panic!("expected result column for {sql}");
         };
         let ast::Expr::FunctionCall {
             order_by,
             within_group,
             ..
-        } = expr.as_ref()
+        } = *expr
         else {
-            panic!("expected function call");
+            panic!("expected function call for {sql}");
         };
-        let [sorted_column] = within_group.as_slice() else {
-            panic!("expected single sorted column");
+        let mut sort_columns = if within_group.is_empty() {
+            order_by
+        } else {
+            assert!(order_by.is_empty(), "for {sql}");
+            within_group
         };
+        assert_eq!(sort_columns.len(), 1, "for {sql}");
+        sort_columns.pop().unwrap()
+    }
+
+    #[test]
+    fn test_function_within_group_order_is_translated() {
+        let sorted_column =
+            function_sort_column("SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM test");
         let ast::Expr::Id(name) = sorted_column.expr.as_ref() else {
             panic!("expected id");
         };
 
         assert_eq!(name.as_str(), "x");
-        assert!(order_by.is_empty());
+        // Omitted NULLS placement stays unset so the supported form still parses.
+        // DESC and an explicit NULLS clause remain visible to the existing diagnostic.
+        assert!(sorted_column.nulls.is_none());
+        assert!(sorted_column.order.is_none());
+
+        let desc = function_sort_column(
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x DESC) FROM test",
+        );
+        assert_eq!(desc.order, Some(ast::SortOrder::Desc));
+        assert!(desc.nulls.is_none());
+
+        let explicit = function_sort_column(
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x NULLS FIRST) FROM test",
+        );
+        assert_eq!(explicit.nulls, Some(ast::NullsOrder::First));
     }
 
     #[test]
     fn test_function_argument_order_is_translated() {
-        let translator = PostgreSQLTranslator::new();
-        let sql = "SELECT array_agg(x ORDER BY y) FROM test";
-        let parsed = crate::parse(sql).unwrap();
-        let translated = translator.translate(&parsed).unwrap();
-
-        let ast::Stmt::Select(select) = translated else {
-            panic!("expected select statement");
-        };
-        let ast::OneSelect::Select { columns, .. } = &select.body.select else {
-            panic!("expected select body");
-        };
-        let ast::ResultColumn::Expr(expr, _) = &columns[0] else {
-            panic!("expected result column");
-        };
-        let ast::Expr::FunctionCall {
-            order_by,
-            within_group,
-            ..
-        } = expr.as_ref()
-        else {
-            panic!("expected function call");
-        };
-        let [sorted_column] = order_by.as_slice() else {
-            panic!("expected single sorted column");
-        };
+        let sorted_column = function_sort_column("SELECT array_agg(x ORDER BY y) FROM test");
         let ast::Expr::Id(name) = sorted_column.expr.as_ref() else {
             panic!("expected id");
         };
 
         assert_eq!(name.as_str(), "y");
-        assert!(within_group.is_empty());
+        assert_eq!(sorted_column.nulls, Some(ast::NullsOrder::Last));
+
+        let desc = function_sort_column("SELECT array_agg(x ORDER BY y DESC) FROM test");
+        assert_eq!(desc.order, Some(ast::SortOrder::Desc));
+        assert_eq!(desc.nulls, Some(ast::NullsOrder::First));
+
+        let explicit =
+            function_sort_column("SELECT array_agg(x ORDER BY y DESC NULLS LAST) FROM test");
+        assert_eq!(explicit.nulls, Some(ast::NullsOrder::Last));
     }
 
     #[test]
@@ -7662,7 +7701,17 @@ mod tests {
         let translator = PostgreSQLTranslator::new();
 
         let cases = [
-            ("SELECT * FROM t ORDER BY a", None),
+            // Omitted direction is ASC. PostgreSQL places those NULLs last;
+            // DESC places them first. Explicit NULLS placement wins.
+            ("SELECT * FROM t ORDER BY a", Some(ast::NullsOrder::Last)),
+            (
+                "SELECT * FROM t ORDER BY a ASC",
+                Some(ast::NullsOrder::Last),
+            ),
+            (
+                "SELECT * FROM t ORDER BY a DESC",
+                Some(ast::NullsOrder::First),
+            ),
             (
                 "SELECT * FROM t ORDER BY a NULLS FIRST",
                 Some(ast::NullsOrder::First),
@@ -7677,6 +7726,14 @@ mod tests {
             ),
             (
                 "SELECT * FROM t ORDER BY a ASC NULLS LAST",
+                Some(ast::NullsOrder::Last),
+            ),
+            (
+                "SELECT * FROM t ORDER BY a ASC NULLS FIRST",
+                Some(ast::NullsOrder::First),
+            ),
+            (
+                "SELECT * FROM t ORDER BY a DESC NULLS LAST",
                 Some(ast::NullsOrder::Last),
             ),
         ];
@@ -7695,64 +7752,132 @@ mod tests {
     #[test]
     fn test_compound_select_order_by_nulls_ordering() {
         let translator = PostgreSQLTranslator::new();
-        let sql = "SELECT a FROM t1 UNION SELECT a FROM t2 ORDER BY a NULLS LAST";
-        let parsed = crate::parse(sql).unwrap();
-        let translated = translator.translate(&parsed).unwrap();
+        let cases = [
+            (
+                "SELECT a FROM t1 UNION SELECT a FROM t2 ORDER BY a",
+                Some(ast::NullsOrder::Last),
+            ),
+            (
+                "SELECT a FROM t1 UNION SELECT a FROM t2 ORDER BY a DESC",
+                Some(ast::NullsOrder::First),
+            ),
+            (
+                "SELECT a FROM t1 UNION SELECT a FROM t2 ORDER BY a NULLS LAST",
+                Some(ast::NullsOrder::Last),
+            ),
+            (
+                "SELECT a FROM t1 UNION SELECT a FROM t2 ORDER BY a DESC NULLS LAST",
+                Some(ast::NullsOrder::Last),
+            ),
+        ];
 
-        let ast::Stmt::Select(select) = translated else {
-            panic!("expected Select statement");
-        };
-        assert_eq!(select.body.compounds.len(), 1, "expected one UNION arm");
-        assert_eq!(select.order_by.len(), 1);
-        assert_eq!(select.order_by[0].nulls, Some(ast::NullsOrder::Last));
+        for (sql, expected_nulls) in cases {
+            let parsed = crate::parse(sql).unwrap();
+            let translated = translator.translate(&parsed).unwrap();
+
+            let ast::Stmt::Select(select) = translated else {
+                panic!("expected Select statement for {sql}");
+            };
+            assert_eq!(
+                select.body.compounds.len(),
+                1,
+                "expected one UNION arm for {sql}"
+            );
+            assert_eq!(select.order_by.len(), 1, "for {sql}");
+            assert_eq!(select.order_by[0].nulls, expected_nulls, "for {sql}");
+        }
     }
 
     #[test]
     fn test_values_order_by_nulls_ordering() {
         let translator = PostgreSQLTranslator::new();
-        let sql = "VALUES (1), (NULL), (2) ORDER BY 1 NULLS LAST";
-        let parsed = crate::parse(sql).unwrap();
-        let translated = translator.translate(&parsed).unwrap();
+        let cases = [
+            (
+                "VALUES (1), (NULL), (2) ORDER BY 1",
+                Some(ast::NullsOrder::Last),
+            ),
+            (
+                "VALUES (1), (NULL), (2) ORDER BY 1 ASC",
+                Some(ast::NullsOrder::Last),
+            ),
+            (
+                "VALUES (1), (NULL), (2) ORDER BY 1 DESC",
+                Some(ast::NullsOrder::First),
+            ),
+            (
+                "VALUES (1), (NULL), (2) ORDER BY 1 NULLS LAST",
+                Some(ast::NullsOrder::Last),
+            ),
+            (
+                "VALUES (1), (NULL), (2) ORDER BY 1 DESC NULLS LAST",
+                Some(ast::NullsOrder::Last),
+            ),
+        ];
 
-        let ast::Stmt::Select(select) = translated else {
-            panic!("expected Select statement");
-        };
-        assert!(
-            matches!(select.body.select, ast::OneSelect::Values(_)),
-            "expected a VALUES body, got {:?}",
-            select.body.select
-        );
-        assert_eq!(select.order_by.len(), 1);
-        assert_eq!(select.order_by[0].nulls, Some(ast::NullsOrder::Last));
+        for (sql, expected_nulls) in cases {
+            let parsed = crate::parse(sql).unwrap();
+            let translated = translator.translate(&parsed).unwrap();
+
+            let ast::Stmt::Select(select) = translated else {
+                panic!("expected Select statement for {sql}");
+            };
+            assert!(
+                matches!(select.body.select, ast::OneSelect::Values(_)),
+                "expected a VALUES body for {sql}, got {:?}",
+                select.body.select
+            );
+            assert_eq!(select.order_by.len(), 1, "for {sql}");
+            assert_eq!(select.order_by[0].nulls, expected_nulls, "for {sql}");
+        }
     }
 
     #[test]
     fn test_window_order_by_nulls_ordering() {
         let translator = PostgreSQLTranslator::new();
-        let sql = "SELECT ROW_NUMBER() OVER (ORDER BY salary NULLS LAST) FROM t";
-        let parsed = crate::parse(sql).unwrap();
-        let translated = translator.translate(&parsed).unwrap();
+        let cases = [
+            (
+                "SELECT ROW_NUMBER() OVER (ORDER BY salary) FROM t",
+                Some(ast::NullsOrder::Last),
+            ),
+            (
+                "SELECT ROW_NUMBER() OVER (ORDER BY salary DESC) FROM t",
+                Some(ast::NullsOrder::First),
+            ),
+            (
+                "SELECT ROW_NUMBER() OVER (ORDER BY salary NULLS LAST) FROM t",
+                Some(ast::NullsOrder::Last),
+            ),
+            (
+                "SELECT ROW_NUMBER() OVER (ORDER BY salary DESC NULLS LAST) FROM t",
+                Some(ast::NullsOrder::Last),
+            ),
+        ];
 
-        let ast::Stmt::Select(select) = translated else {
-            panic!("expected Select statement");
-        };
-        let ast::OneSelect::Select { columns, .. } = &select.body.select else {
-            panic!("expected Select body");
-        };
-        let ast::ResultColumn::Expr(expr, _) = &columns[0] else {
-            panic!("expected expression result column");
-        };
-        let ast::Expr::FunctionCall { filter_over, .. } = expr.as_ref() else {
-            panic!("expected function call expression, got {expr:?}");
-        };
-        let Some(ast::Over::Window(window)) = filter_over.over_clause.as_deref() else {
-            panic!(
-                "expected inline OVER window, got {:?}",
-                filter_over.over_clause
-            );
-        };
-        assert_eq!(window.order_by.len(), 1);
-        assert_eq!(window.order_by[0].nulls, Some(ast::NullsOrder::Last));
+        for (sql, expected_nulls) in cases {
+            let parsed = crate::parse(sql).unwrap();
+            let translated = translator.translate(&parsed).unwrap();
+
+            let ast::Stmt::Select(select) = translated else {
+                panic!("expected Select statement for {sql}");
+            };
+            let ast::OneSelect::Select { columns, .. } = &select.body.select else {
+                panic!("expected Select body for {sql}");
+            };
+            let ast::ResultColumn::Expr(expr, _) = &columns[0] else {
+                panic!("expected expression result column for {sql}");
+            };
+            let ast::Expr::FunctionCall { filter_over, .. } = expr.as_ref() else {
+                panic!("expected function call expression for {sql}, got {expr:?}");
+            };
+            let Some(ast::Over::Window(window)) = filter_over.over_clause.as_deref() else {
+                panic!(
+                    "expected inline OVER window for {sql}, got {:?}",
+                    filter_over.over_clause
+                );
+            };
+            assert_eq!(window.order_by.len(), 1, "for {sql}");
+            assert_eq!(window.order_by[0].nulls, expected_nulls, "for {sql}");
+        }
     }
 
     #[test]
@@ -7769,7 +7894,47 @@ mod tests {
                 assert_eq!(window_clause[0].name.as_str(), "w");
                 assert_eq!(window_clause[0].window.partition_by.len(), 1);
                 assert_eq!(window_clause[0].window.order_by.len(), 1);
+                assert_eq!(
+                    window_clause[0].window.order_by[0].nulls,
+                    Some(ast::NullsOrder::Last)
+                );
             }
+        }
+    }
+
+    #[test]
+    fn test_named_window_order_by_nulls_ordering() {
+        let translator = PostgreSQLTranslator::new();
+        let cases = [
+            (
+                "SELECT ROW_NUMBER() OVER w FROM t WINDOW w AS (ORDER BY salary)",
+                Some(ast::NullsOrder::Last),
+            ),
+            (
+                "SELECT ROW_NUMBER() OVER w FROM t WINDOW w AS (ORDER BY salary DESC)",
+                Some(ast::NullsOrder::First),
+            ),
+            (
+                "SELECT ROW_NUMBER() OVER w FROM t WINDOW w AS (ORDER BY salary DESC NULLS LAST)",
+                Some(ast::NullsOrder::Last),
+            ),
+        ];
+
+        for (sql, expected_nulls) in cases {
+            let parsed = crate::parse(sql).unwrap();
+            let translated = translator.translate(&parsed).unwrap();
+            let ast::Stmt::Select(select) = translated else {
+                panic!("expected Select statement for {sql}");
+            };
+            let ast::OneSelect::Select { window_clause, .. } = &select.body.select else {
+                panic!("expected Select body for {sql}");
+            };
+            assert_eq!(window_clause.len(), 1, "for {sql}");
+            assert_eq!(window_clause[0].window.order_by.len(), 1, "for {sql}");
+            assert_eq!(
+                window_clause[0].window.order_by[0].nulls, expected_nulls,
+                "for {sql}"
+            );
         }
     }
 

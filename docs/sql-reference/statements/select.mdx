@@ -330,22 +330,26 @@ SELECT name, salary * 12 AS annual FROM employees ORDER BY annual DESC;
 
 ### NULLS FIRST / NULLS LAST
 
-Controls where NULL values appear in the sorted result. NULL sorts as smaller than every other value, so by default NULLs come first in ascending order and last in descending order.
+Controls where NULL values appear in the sorted result. An explicit `NULLS FIRST` or `NULLS LAST` overrides the default for that sort key.
+
+SQLite-compatible SQL treats NULL as smaller than every other value. Ascending order, including an omitted direction, places NULLs first. Descending order places them last.
+
+The PostgreSQL frontend resolves placement while it translates `ORDER BY`. An omitted direction and `ASC` place NULLs last. `DESC` places them first.
 
 ```sql
--- Move NULLs to the end (overrides the ASC default of NULLS FIRST)
+-- SQLite-compatible SQL: move NULLs to the end (overrides ASC NULLS FIRST)
 SELECT * FROM employees ORDER BY manager_id ASC NULLS LAST;
 
--- Move NULLs to the beginning (overrides the DESC default of NULLS LAST)
+-- SQLite-compatible SQL: move NULLs to the beginning (overrides DESC NULLS LAST)
 SELECT * FROM employees ORDER BY manager_id DESC NULLS FIRST;
 ```
 
-| Direction | Default NULL Placement |
-|-----------|----------------------|
-| ASC | NULLS FIRST |
-| DESC | NULLS LAST |
+| Direction | SQLite default | PostgreSQL frontend default |
+|-----------|----------------|-----------------------------|
+| ASC, or direction omitted | NULLS FIRST | NULLS LAST |
+| DESC | NULLS LAST | NULLS FIRST |
 
-An index whose columns are declared with a matching NULL placement can return rows in the requested order directly, letting the query skip the sort step. See [NULL ordering in indexes](/docs/sql-reference/statements/create-index#nulls-first-last).
+An index whose columns are declared with a matching NULL placement can return rows in the requested order directly, letting the query skip the sort step. Index defaults follow the SQLite column above. See [NULL ordering in indexes](/docs/sql-reference/statements/create-index#nulls-first-last).
 
 ## LIMIT and OFFSET
 
